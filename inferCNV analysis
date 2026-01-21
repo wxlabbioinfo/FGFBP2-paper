@@ -1,0 +1,223 @@
+
+#
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(dplyr)
+  library(ggplot2)
+  library(stringr)
+  library(infercnv)
+})
+
+args <- commandArgs(trailingOnly = TRUE)
+get_arg <- function(flag, default = NULL) {
+  hit <- which(args == flag)
+  if (length(hit) == 0) return(default)
+  if (hit == length(args)) stop(paste("Missing value for", flag))
+  args[hit + 1]
+}
+
+data_dir   <- get_arg("--data_dir", default = ".")
+out_dir    <- get_arg("--out_dir",  default = file.path(data_dir, "output_infercnv"))
+seurat_rds <- get_arg("--seurat_rds", default = file.path(data_dir, "GSE212966_seurat_integrated_CCA_final_0.7_by_Cluster.rds"))
+gene_pos   <- get_arg("--gene_pos", default = file.path(data_dir, "gencode_v21_gen_pos.complete.txt"))
+
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+infercnv_dir <- file.path(out_dir, "infercnv_output")
+dir.create(infercnv_dir, showWarnings = FALSE, recursive = TRUE)
+
+if (!file.exists(seurat_rds)) stop("Cannot find seurat_rds: ", seurat_rds)
+if (!file.exists(gene_pos))   stop("Cannot find gene_pos: ", gene_pos)
+
+message("seurat_rds: ", normalizePath(seurat_rds))
+message("gene_pos  : ", normalizePath(gene_pos))
+message("out_dir   : ", normalizePath(out_dir))
+
+# ----------------------------
+# Step 1: Load Seurat object
+# ----------------------------
+seurat_integrated <- readRDS(seurat_rds)
+
+# Optional: Rename identities to cell types (must match number of clusters)
+# If your object already has correct identities, you can skip this part.
+new.cluster.ids <- c(
+  "Fibroblasts","CD8+ T cells","CD4+ T cells","Macrophages","Fibroblasts",
+  "Tumor cells","CD8+ T cells","B cells","Tumor cells","Stellate cells",
+  "Endothelial cells","CD4+ T cells","Mast cells","NK cells","CD4+ T cells",
+  "Neutrophils","Endocrine cells","Tumor cells","Tumor cells",
+  "B cells","Dendritic cells","Ductal cells","Schwann cells",
+  "CD8+ T cells","Fibroblasts","Ductal cells","Endocrine cells"
+)
+
+if (length(new.cluster.ids) == length(levels(Idents(seurat_integrated)))) {
+  names(new.cluster.ids) <- levels(Idents(seurat_integrated))
+  seurat_integrated <- RenameIdents(seurat_integrated, new.cluster.ids)
+} else {
+  message("Skip RenameIdents(): mapping length does not match number of identities.")
+}
+
+# Quick check plot (optional)
+p_check <- DimPlot(seurat_integrated, reduction = "umap", label = TRUE) + NoLegend()
+ggsave(file.path(out_dir, "UMAP_identity_check.pdf"), p_check, width = 10, height = 8)
+
+# ----------------------------
+# Step 2: Subset target groups + reference groups
+# ----------------------------
+# NOTE:
+# In your original script, you mixed numeric clusters (e.g., "5") and cell-type labels.
+# This only works if those identities exist in Idents(seurat_integrated).
+# Update these vectors to match your object identities.
+
+target_groups <- c("5", "8", "17", "18", "21", "25")  # example
+ref_groups    <- c("Macrophages", "NK cells")         # reference normal groups
+
+idents_now <- levels(Idents(seurat_integrated))
+missing_targets <- setdiff(target_groups, idents_now)
+missing_refs    <- setdiff(ref_groups, idents_now)
+
+if (length(missing_targets) > 0) {
+  warning("Missing target identities: ", paste(missing_targets, collapse = ", "))
+}
+if (length(missing_refs) > 0) {
+  warning("Missing reference identities: ", paste(missing_refs, collapse = ", "))
+}
+
+subset_cells <- subset(seurat_integrated, idents = c(target_groups, ref_groups))
+write.csv(as.data.frame(table(Idents(subset_cells))),
+          file.path(out_dir, "subset_identity_counts.csv"),
+          row.names = FALSE)
+
+# ----------------------------
+# Step 3: Build raw counts matrix (Seurat v5 layers aware)
+# ----------------------------
+DefaultAssay(subset_cells) <- "RNA"
+
+rna_assay <- subset_cells[["RNA"]]
+
+# Prefer a single "counts" layer if present
+layer_names <- tryCatch(names(rna_assay@layers), error = function(e) character(0))
+
+get_counts_matrix <- function(assay, obj) {
+  # If standard counts slot exists, use it
+  m <- tryCatch(GetAssayData(obj, assay = "RNA", slot = "counts"), error = function(e) NULL)
+  if (!is.null(m) && ncol(m) > 0) return(m)
+
+  # Seurat v5: counts may be split across layers like counts.GSMxxxx
+  layers <- tryCatch(assay@layers, error = function(e) NULL)
+  if (is.null(layers) || length(layers) == 0) stop("No counts found in slots/layers.")
+
+  # Take all layers that start with "counts"
+  ln <- names(layers)
+  use_ln <- ln[grepl("^counts", ln)]
+  if (length(use_ln) == 0) stop("No 'counts*' layers found in RNA assay.")
+
+  mats <- lapply(use_ln, function(nm) layers[[nm]])
+  m_all <- do.call(cbind, mats)
+
+  # Ensure dimnames
+  rownames(m_all) <- rownames(obj[["RNA"]])
+  colnames(m_all) <- colnames(obj)
+
+  m_all
+}
+
+counts_matrix <- get_counts_matrix(rna_assay, subset_cells)
+
+# ----------------------------
+# Step 4: Create cell annotation file
+# ----------------------------
+cell_annotations <- data.frame(
+  cell  = colnames(counts_matrix),
+  group = as.character(Idents(subset_cells)),
+  stringsAsFactors = FALSE
+)
+
+anno_path <- file.path(out_dir, "cell_annotations.txt")
+write.table(cell_annotations, file = anno_path, sep = "\t",
+            quote = FALSE, row.names = FALSE, col.names = FALSE)
+
+# ----------------------------
+# Step 5: Prepare gene order file from gencode gene positions
+# ----------------------------
+gene_order <- read.table(gene_pos, header = FALSE, sep = "\t", stringsAsFactors = FALSE)
+colnames(gene_order) <- c("gene", "chr", "start", "end")
+
+# Remove suffix after "|" and "."
+gene_order$gene <- sapply(strsplit(gene_order$gene, "\\|"), `[`, 1)
+gene_order$gene <- sapply(strsplit(gene_order$gene, "\\."), `[`, 1)
+
+# Ensure counts gene names also remove version suffix
+rownames(counts_matrix) <- sapply(strsplit(rownames(counts_matrix), "\\."), `[`, 1)
+
+common_genes <- intersect(rownames(counts_matrix), gene_order$gene)
+counts_matrix <- counts_matrix[common_genes, , drop = FALSE]
+gene_order <- gene_order[gene_order$gene %in% common_genes, , drop = FALSE]
+gene_order <- gene_order[match(rownames(counts_matrix), gene_order$gene), , drop = FALSE]
+
+if (any(is.na(gene_order$gene))) stop("Gene order has NA after matching; check gene_pos format.")
+
+gene_order_path <- file.path(out_dir, "gene_order.txt")
+write.table(gene_order, file = gene_order_path, sep = "\t",
+            quote = FALSE, row.names = FALSE, col.names = FALSE)
+
+# ----------------------------
+# Step 6: Create and run inferCNV
+# ----------------------------
+infercnv_obj <- CreateInfercnvObject(
+  raw_counts_matrix = counts_matrix,
+  annotations_file  = anno_path,
+  delim             = "\t",
+  gene_order_file   = gene_order_path,
+  ref_group_names   = ref_groups
+)
+
+infercnv_res <- infercnv::run(
+  infercnv_obj,
+  cutoff            = 0.1,
+  out_dir           = infercnv_dir,
+  cluster_by_groups = TRUE,
+  denoise           = TRUE,
+  HMM               = TRUE
+)
+
+saveRDS(infercnv_res, file = file.path(infercnv_dir, "infercnv_obj.rds"))
+
+# ----------------------------
+# Step 7: CNV score per cell + visualization
+# ----------------------------
+cnv_scores <- infercnv_res@expr.data
+cell_cnv_scores <- colMeans(cnv_scores, na.rm = TRUE)
+
+cell_annotations$cnv_score <- cell_cnv_scores[cell_annotations$cell]
+
+target_cells <- cell_annotations[cell_annotations$group %in% target_groups, , drop = FALSE]
+normal_cells <- cell_annotations[cell_annotations$group %in% ref_groups, , drop = FALSE]
+combined_data <- rbind(target_cells, normal_cells)
+
+write.csv(combined_data,
+          file = file.path(out_dir, "target_and_reference_cnv_scores.csv"),
+          row.names = FALSE)
+
+
+# Plot
+cnv_plot <- ggplot(combined_data, aes(x = group, y = cnv_score)) +
+  geom_boxplot() +
+  theme_minimal() +
+  labs(title = "", x = "Group", y = "CNV score") +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.line = element_line(color = "black"),
+    axis.text.x = element_text(size = 8, angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 10),
+    axis.title.x = element_text(size = 14),
+    axis.title.y = element_text(size = 14)
+  )
+
+ggsave(
+  filename = file.path(out_dir, "CNV_score_boxplot.pdf"),
+  plot = cnv_plot,
+  width = 8,
+  height = 6
+)
+
+message("inferCNV pipeline completed. Outputs saved in: ", normalizePath(out_dir))
