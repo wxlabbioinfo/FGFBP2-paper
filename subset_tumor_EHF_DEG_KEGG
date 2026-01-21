@@ -1,0 +1,115 @@
+#!/usr/bin/env Rscript
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(dplyr)
+  library(ggplot2)
+  library(clusterProfiler)
+  library(org.Hs.eg.db)
+})
+
+args <- commandArgs(trailingOnly = TRUE)
+get_arg <- function(flag, default = NULL) {
+  hit <- which(args == flag)
+  if (length(hit) == 0) return(default)
+  if (hit == length(args)) stop(paste("Missing value for", flag))
+  args[hit + 1]
+}
+
+out_dir    <- get_arg("--out_dir", default = "./output")
+resolution <- as.numeric(get_arg("--resolution", default = "0.7"))
+
+rds_in <- file.path(out_dir, paste0("GSE212966_integrated_annotated_res", resolution, ".rds"))
+if (!file.exists(rds_in)) stop("Cannot find: ", rds_in)
+
+seurat_integrated <- readRDS(rds_in)
+DefaultAssay(seurat_integrated) <- "RNA"
+
+# Subset tumor cells
+seurat_tumor <- subset(seurat_integrated, idents = "Tumor cells")
+saveRDS(seurat_tumor, file.path(out_dir, "Tumor_subset_raw.rds"))
+
+# Re-cluster tumor subset
+DefaultAssay(seurat_tumor) <- "RNA"
+suppressWarnings({
+  try(seurat_tumor <- JoinLayers(seurat_tumor, layers = c("RNA", "integrated")), silent = TRUE)
+})
+
+seurat_tumor <- NormalizeData(seurat_tumor)
+seurat_tumor <- FindVariableFeatures(seurat_tumor, selection.method = "vst", nfeatures = 2000)
+seurat_tumor <- ScaleData(seurat_tumor)
+seurat_tumor <- RunPCA(seurat_tumor, features = VariableFeatures(seurat_tumor))
+seurat_tumor <- RunUMAP(seurat_tumor, dims = 1:10)
+seurat_tumor <- FindNeighbors(seurat_tumor, dims = 1:10)
+seurat_tumor <- FindClusters(seurat_tumor, resolution = 0.1)
+
+pdf(file.path(out_dir, "Tumor_UMAP_clusters_res0.1.pdf"), width = 8, height = 6)
+print(DimPlot(seurat_tumor, reduction = "umap", label = TRUE) + NoLegend())
+dev.off()
+
+# Tumor markers
+DefaultAssay(seurat_tumor) <- "RNA"
+tumor_markers <- FindAllMarkers(seurat_tumor, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+write.csv(tumor_markers, file.path(out_dir, "Tumor_markers_res0.1.csv"), row.names = FALSE)
+saveRDS(seurat_tumor, file.path(out_dir, "Tumor_subset_res0.1.rds"))
+
+# EHF expression plots
+vln <- VlnPlot(seurat_tumor, features = "EHF", pt.size = 0) +
+  scale_y_continuous(limits = c(0, NA)) +
+  labs(title = "", x = "Cluster", y = "Expression")
+ggsave(file.path(out_dir, "Tumor_EHF_violin.pdf"), vln, width = 7, height = 5)
+
+fp <- FeaturePlot(seurat_tumor, features = "EHF") + labs(title = "")
+ggsave(file.path(out_dir, "Tumor_EHF_UMAP.pdf"), fp, width = 7, height = 5, dpi = 300)
+
+# Define EHF low/high clusters (keep your original logic; adjust if needed)
+low_clusters  <- c(7)
+high_clusters <- c(0, 1, 2, 3, 4, 5, 6)
+
+seurat_tumor$EHF_group <- ifelse(
+  seurat_tumor$seurat_clusters %in% low_clusters,
+  "EHF_minus_Tumor",
+  "EHF_plus_Tumor"
+)
+
+write.csv(
+  as.data.frame(table(seurat_tumor$EHF_group)),
+  file.path(out_dir, "Tumor_EHF_group_counts.csv"),
+  row.names = FALSE
+)
+
+dp <- DimPlot(seurat_tumor, reduction = "umap", group.by = "EHF_group", label = TRUE) + labs(title = "")
+ggsave(file.path(out_dir, "Tumor_EHF_group_UMAP.pdf"), dp, width = 7, height = 5)
+
+# DEG: EHF+ vs EHF-
+Idents(seurat_tumor) <- "EHF_group"
+DefaultAssay(seurat_tumor) <- "RNA"
+
+deg <- FindMarkers(
+  object = seurat_tumor,
+  ident.1 = "EHF_plus_Tumor",
+  ident.2 = "EHF_minus_Tumor",
+  min.pct = 0.25,
+  logfc.threshold = 0.25,
+  verbose = FALSE
+)
+
+write.csv(deg, file.path(out_dir, "Tumor_EHF_DEG.csv"))
+
+sig_deg <- deg[deg$p_val_adj < 0.05, , drop = FALSE]
+write.csv(sig_deg, file.path(out_dir, "Tumor_EHF_DEG_significant_adjP0.05.csv"))
+
+sig_genes <- rownames(sig_deg)
+
+# KEGG enrichment
+gene_df <- bitr(sig_genes, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+gene_entrez <- unique(gene_df$ENTREZID)
+
+kegg <- enrichKEGG(gene = gene_entrez, organism = "hsa", pvalueCutoff = 0.05)
+write.csv(as.data.frame(kegg), file.path(out_dir, "Tumor_EHF_KEGG.csv"), row.names = FALSE)
+
+# KEGG barplot
+pdf(file.path(out_dir, "Tumor_EHF_KEGG_barplot.pdf"), width = 8, height = 9)
+print(barplot(kegg, showCategory = 20, color = "p.adjust", title = ""))
+dev.off()
+
+message("03 done.")
