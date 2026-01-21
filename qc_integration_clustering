@@ -1,0 +1,197 @@
+Code used in the manuscript:
+"FGFBP2 p.T186S mutation in tumor associated fibroblasts supports progression of pancreatic cancer through autocrine and paracrine mechanisms".
+
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(dplyr)
+  library(ggplot2)
+  library(stringr)
+  library(openxlsx)
+})
+
+# ----------------------------
+# Simple argument parser
+# ----------------------------
+args <- commandArgs(trailingOnly = TRUE)
+get_arg <- function(flag, default = NULL) {
+  hit <- which(args == flag)
+  if (length(hit) == 0) return(default)
+  if (hit == length(args)) stop(paste("Missing value for", flag))
+  args[hit + 1]
+}
+
+data_dir   <- get_arg("--data_dir", default = ".")
+out_dir    <- get_arg("--out_dir",  default = file.path(data_dir, "output"))
+resolution <- as.numeric(get_arg("--resolution", default = "0.7"))
+
+if (!dir.exists(data_dir)) stop("data_dir does not exist: ", data_dir)
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+message("data_dir: ", normalizePath(data_dir))
+message("out_dir : ", normalizePath(out_dir))
+message("resolution: ", resolution)
+
+# ----------------------------
+# Step 0: Prepare 10X folders
+# ----------------------------
+fs <- list.files(data_dir, pattern = "^GSM", full.names = FALSE)
+if (length(fs) == 0) stop("No files starting with 'GSM' found in data_dir")
+
+samples <- str_split(fs, "_", simplify = TRUE)[, 1]
+
+# Reorganize each GSM into a 10X folder:
+# - barcodes.tsv.gz
+# - features.tsv.gz
+# - matrix.mtx.gz
+# NOTE: This assumes each sample has exactly 3 relevant files.
+invisible(lapply(unique(samples), function(x) {
+  y <- fs[grepl(x, fs)]
+  if (length(y) < 3) {
+    warning("Skip ", x, " because less than 3 files were found.")
+    return(NULL)
+  }
+
+  folder <- x
+  dir.create(file.path(data_dir, folder), showWarnings = FALSE, recursive = TRUE)
+
+  # If ordering is uncertain, you may need to sort y by keywords.
+  # Here we keep your original logic (first three files).
+  file.rename(file.path(data_dir, y[1]), file.path(data_dir, folder, "barcodes.tsv.gz"))
+  file.rename(file.path(data_dir, y[2]), file.path(data_dir, folder, "features.tsv.gz"))
+  file.rename(file.path(data_dir, y[3]), file.path(data_dir, folder, "matrix.mtx.gz"))
+}))
+
+folders <- list.files(data_dir, pattern = "^GSM", full.names = FALSE)
+if (length(folders) == 0) stop("No GSM folders found after reorganization.")
+
+# ----------------------------
+# Step 1: Read 10X and create Seurat objects
+# ----------------------------
+seurat_list <- lapply(folders, function(folder) {
+  data <- Read10X(data.dir = file.path(data_dir, folder))
+  CreateSeuratObject(
+    counts = data,
+    project = folder,
+    min.cells = 3,
+    min.features = 200
+  )
+})
+
+# ----------------------------
+# Step 2: Merge
+# ----------------------------
+merged_seurat <- merge(
+  seurat_list[[1]],
+  y = seurat_list[-1],
+  add.cell.ids = folders,
+  project = "TumorIntegration"
+)
+
+# ----------------------------
+# Step 3: Mito percentage + QC
+# ----------------------------
+merged_seurat[["percent.mt"]] <- PercentageFeatureSet(merged_seurat, pattern = "^MT-")
+
+qc_pdf <- file.path(out_dir, "qc_violin.pdf")
+pdf(qc_pdf, width = 12, height = 5)
+print(VlnPlot(merged_seurat, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3))
+dev.off()
+
+# QC filter thresholds (keep as parameters if you want)
+merged_seurat <- subset(
+  merged_seurat,
+  subset = nFeature_RNA > 500 & nCount_RNA > 1000 & percent.mt < 25
+)
+
+# ----------------------------
+# Step 4: Normalize + HVGs
+# ----------------------------
+DefaultAssay(merged_seurat) <- "RNA"
+merged_seurat <- NormalizeData(merged_seurat)
+merged_seurat <- FindVariableFeatures(merged_seurat, selection.method = "vst", nfeatures = 2000)
+
+# ----------------------------
+# Step 5: Split by sample and prepare for integration
+# ----------------------------
+seurat_list <- SplitObject(merged_seurat, split.by = "orig.ident")
+common_genes <- Reduce(intersect, lapply(seurat_list, rownames))
+
+seurat_list <- lapply(seurat_list, function(obj) {
+  obj <- obj[common_genes, ]
+  obj <- NormalizeData(obj)
+  obj <- FindVariableFeatures(obj, selection.method = "vst", nfeatures = 2000)
+  obj
+})
+
+# ----------------------------
+# Step 6: CCA integration
+# ----------------------------
+anchors <- FindIntegrationAnchors(object.list = seurat_list, dims = 1:30)
+seurat_integrated <- IntegrateData(anchorset = anchors, dims = 1:30)
+
+saveRDS(seurat_integrated, file.path(out_dir, "GSE212966_seurat_integrated_CCA.rds"))
+
+# ----------------------------
+# Step 7: PCA/UMAP + clustering
+# ----------------------------
+DefaultAssay(seurat_integrated) <- "integrated"
+
+# If you use Seurat v5 layers, JoinLayers can be helpful; keep it optional
+suppressWarnings({
+  try(seurat_integrated <- JoinLayers(object = seurat_integrated, layers = c("RNA", "integrated")), silent = TRUE)
+})
+
+seurat_integrated <- ScaleData(seurat_integrated)
+seurat_integrated <- RunPCA(seurat_integrated, npcs = 30)
+seurat_integrated <- RunUMAP(seurat_integrated, dims = 1:30)
+
+seurat_integrated <- FindNeighbors(seurat_integrated, dims = 1:30)
+seurat_integrated <- FindClusters(seurat_integrated, resolution = resolution, algorithm = 1)
+
+# UMAP plots
+umap_cluster_pdf <- file.path(out_dir, paste0("umap_clusters_res", resolution, ".pdf"))
+pdf(umap_cluster_pdf, width = 10, height = 8)
+print(DimPlot(seurat_integrated, reduction = "umap", label = TRUE) + NoLegend())
+dev.off()
+
+umap_sample_pdf <- file.path(out_dir, paste0("umap_by_sample_res", resolution, ".pdf"))
+pdf(umap_sample_pdf, width = 12, height = 8)
+print(DimPlot(seurat_integrated, reduction = "umap", group.by = "orig.ident"))
+dev.off()
+
+# Save final object
+saveRDS(
+  seurat_integrated,
+  file.path(out_dir, paste0("GSE212966_seurat_integrated_CCA_final_res", resolution, ".rds"))
+)
+
+# ----------------------------
+# Step 8: Markers and export
+# ----------------------------
+DefaultAssay(seurat_integrated) <- "RNA"
+markers <- FindAllMarkers(seurat_integrated, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+
+saveRDS(markers, file.path(out_dir, paste0("markers_res", resolution, ".rds")))
+write.csv(markers, file.path(out_dir, paste0("markers_res", resolution, ".csv")), row.names = FALSE)
+
+# Export markers to Excel (one sheet per cluster)
+wb <- createWorkbook()
+clusters <- sort(unique(markers$cluster))
+
+for (cl in clusters) {
+  df <- markers[markers$cluster == cl, ]
+  df <- df[order(df$avg_log2FC, decreasing = TRUE), ]
+  sheet_name <- paste0("Cluster_", cl)
+  addWorksheet(wb, sheet_name)
+  writeData(wb, sheet = sheet_name, df)
+}
+
+saveWorkbook(
+  wb,
+  file.path(out_dir, paste0("markers_res", resolution, "_by_cluster.xlsx")),
+  overwrite = TRUE
+)
+
+message("Done. Outputs saved in: ", normalizePath(out_dir))
