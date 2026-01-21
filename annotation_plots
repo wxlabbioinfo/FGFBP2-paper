@@ -1,0 +1,101 @@
+#!/usr/bin/env Rscript
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(ggplot2)
+  library(readxl)
+  library(dplyr)
+})
+
+args <- commandArgs(trailingOnly = TRUE)
+get_arg <- function(flag, default = NULL) {
+  hit <- which(args == flag)
+  if (length(hit) == 0) return(default)
+  if (hit == length(args)) stop(paste("Missing value for", flag))
+  args[hit + 1]
+}
+
+out_dir    <- get_arg("--out_dir", default = "./output")
+resolution <- as.numeric(get_arg("--resolution", default = "0.7"))
+marker_xlsx <- get_arg("--marker_xlsx", default = file.path(out_dir, "gene_marker.xlsx"))
+
+rds_in <- file.path(out_dir, paste0("GSE212966_integrated_res", resolution, ".rds"))
+if (!file.exists(rds_in)) stop("Cannot find: ", rds_in)
+
+seurat_integrated <- readRDS(rds_in)
+DefaultAssay(seurat_integrated) <- "RNA"
+
+# Cell-type annotation mapping (must match number of clusters)
+new.cluster.ids <- c(
+  "Fibroblasts","CD8+ T cells","CD4+ T cells","Macrophages","Fibroblasts",
+  "Tumor cells","CD8+ T cells","B cells","Tumor cells","Stellate cells",
+  "Endothelial cells","CD4+ T cells","Mast cells","NK cells","CD4+ T cells",
+  "Neutrophils","Endocrine cells","Tumor cells","Tumor cells",
+  "B cells","Dendritic cells","Ductal cells","Schwann cells",
+  "CD8+ T cells","Fibroblasts","Ductal cells","Endocrine cells"
+)
+
+if (length(new.cluster.ids) != length(levels(seurat_integrated))) {
+  stop("new.cluster.ids length (", length(new.cluster.ids),
+       ") != number of clusters (", length(levels(seurat_integrated)), "). Update mapping.")
+}
+
+names(new.cluster.ids) <- levels(seurat_integrated)
+seurat_integrated <- RenameIdents(seurat_integrated, new.cluster.ids)
+
+# Annotated UMAP
+pdf(file.path(out_dir, paste0("UMAP_celltypes_res", resolution, ".pdf")), width = 12, height = 8)
+print(DimPlot(seurat_integrated, reduction = "umap", label = TRUE, pt.size = 0.5) + NoLegend())
+dev.off()
+
+saveRDS(seurat_integrated, file.path(out_dir, paste0("GSE212966_integrated_annotated_res", resolution, ".rds")))
+
+# EHF violin
+DefaultAssay(seurat_integrated) <- "RNA"
+vln <- VlnPlot(seurat_integrated, features = "EHF", pt.size = 0) +
+  scale_y_continuous(limits = c(0, NA)) +
+  labs(title = "", x = "Cell type", y = "Expression")
+
+ggsave(
+  filename = file.path(out_dir, paste0("EHF_violin_res", resolution, ".pdf")),
+  plot = vln, width = 7, height = 5
+)
+
+# EHF FeaturePlot (keep default colors unless you want fixed palette)
+ehf_fp <- FeaturePlot(seurat_integrated, features = "EHF") + labs(title = "")
+ggsave(
+  filename = file.path(out_dir, paste0("EHF_UMAP_res", resolution, ".pdf")),
+  plot = ehf_fp, width = 7, height = 5, dpi = 300
+)
+
+# DotPlot using marker_xlsx (2nd column as genes, comma-separated)
+if (file.exists(marker_xlsx)) {
+  gene_list_data <- read_excel(marker_xlsx)
+  gene_list <- unlist(strsplit(paste(gene_list_data[[2]], collapse = ","), ","))
+  gene_list <- trimws(gene_list)
+  gene_list <- gene_list[gene_list %in% rownames(seurat_integrated)]
+  gene_list <- unique(gene_list)
+
+  cell_order <- c(
+    "Fibroblasts","Stellate cells","CD4+ T cells","CD8+ T cells","NK cells","Ductal cells",
+    "Macrophages","Dendritic cells","B cells","Endothelial cells",
+    "Mast cells","Endocrine cells","Neutrophils","Schwann cells","Tumor cells"
+  )
+
+  dp <- DotPlot(seurat_integrated, features = gene_list, dot.scale = 8) +
+    theme(
+      axis.text.x = element_text(angle = 90, hjust = 1, size = 12),
+      axis.text.y = element_text(size = 12),
+      axis.title = element_blank()
+    ) +
+    scale_y_discrete(limits = cell_order) +
+    labs(title = "")
+
+  ggsave(
+    filename = file.path(out_dir, paste0("DotPlot_markers_res", resolution, ".pdf")),
+    plot = dp, width = 12, height = 8
+  )
+} else {
+  message("marker_xlsx not found, skip DotPlot: ", marker_xlsx)
+}
+
+message("02 done.")
