@@ -1,0 +1,272 @@
+#!/usr/bin/env Rscript
+
+# ============================================================
+# Visium (10X Spatial) + RCTD deconvolution + spatial smoothing correlation
+#
+# Usage example (PDAC_7A):
+#     --sample_id "PDAC_7A" \
+#     --spatial_dir "E:/Germany work/project1/EHF  Spatial Transcriptomic/GSM8452867" \
+#     --h5_filename "GSM8452867_Pt-7A_filtered_feature_bc_matrix.h5" \
+#     --species "human" \
+#
+# PDAC_13A: run again with a different --sample_id / --spatial_dir / --h5_filename
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(ggplot2)
+  library(patchwork)
+  library(dplyr)
+  library(stringr)
+  library(spacexr)
+  library(Matrix)
+  library(FNN)
+  library(ggpubr)
+})
+
+args <- commandArgs(trailingOnly = TRUE)
+get_arg <- function(flag, default = NULL) {
+  hit <- which(args == flag)
+  if (length(hit) == 0) return(default)
+  if (hit == length(args)) stop(paste("Missing value for", flag))
+  args[hit + 1]
+}
+
+sample_id   <- get_arg("--sample_id",   default = "PDAC_sample")
+spatial_dir <- get_arg("--spatial_dir", default = ".")
+h5_filename <- get_arg("--h5_filename", default = "")
+sc_rds      <- get_arg("--sc_rds",      default = "")
+out_dir     <- get_arg("--out_dir",     default = "./output_spatial")
+species     <- tolower(get_arg("--species", default = "human"))
+knn_k       <- as.integer(get_arg("--knn_k", default = "6"))
+rctd_cores  <- as.integer(get_arg("--rctd_cores", default = "8"))
+
+if (!dir.exists(spatial_dir)) stop("spatial_dir does not exist: ", spatial_dir)
+if (h5_filename == "") stop("--h5_filename is required")
+if (sc_rds == "" || !file.exists(sc_rds)) stop("Cannot find --sc_rds")
+if (!file.exists(file.path(spatial_dir, h5_filename))) stop("Cannot find h5 file in spatial_dir")
+
+out_sample <- file.path(out_dir, sample_id)
+dir.create(out_sample, showWarnings = FALSE, recursive = TRUE)
+
+message("sample_id  : ", sample_id)
+message("spatial_dir: ", normalizePath(spatial_dir))
+message("h5_filename: ", h5_filename)
+message("sc_rds     : ", normalizePath(sc_rds))
+message("out_sample : ", normalizePath(out_sample))
+
+# ------------------------------------------------------------
+# Helper: get counts matrix from Seurat v5 (layers-aware)
+# ------------------------------------------------------------
+get_counts_matrix <- function(obj, assay = "RNA") {
+  DefaultAssay(obj) <- assay
+  m <- tryCatch(GetAssayData(obj, assay = assay, slot = "counts"), error = function(e) NULL)
+  if (!is.null(m) && ncol(m) > 0) return(m)
+
+  assay_obj <- obj[[assay]]
+  ln <- tryCatch(names(assay_obj@layers), error = function(e) character(0))
+  use_ln <- ln[grepl("^counts", ln)]
+  if (length(use_ln) == 0) stop("No counts slot and no counts* layers found.")
+  mats <- lapply(use_ln, function(nm) assay_obj@layers[[nm]])
+  m_all <- do.call(cbind, mats)
+  rownames(m_all) <- rownames(obj[[assay]])
+  colnames(m_all) <- colnames(obj)
+  m_all
+}
+
+# ------------------------------------------------------------
+# 1) Load Visium data
+# ------------------------------------------------------------
+visium <- Load10X_Spatial(
+  data.dir = spatial_dir,
+  filename = h5_filename,
+  assay = "spatial",
+  slice = "slice1",
+  filter.matrix = TRUE,
+  to.upper = FALSE
+)
+
+# QC plots
+p_vln <- VlnPlot(visium, features = "nCount_spatial", pt.size = 0.1) + NoLegend()
+p_sp  <- SpatialFeaturePlot(visium, features = "nCount_spatial") + theme(legend.position = "right")
+p_qc  <- wrap_plots(p_vln, p_sp)
+
+ggsave(file.path(out_sample, paste0(sample_id, "_nCount_spatial_QC.pdf")),
+       plot = p_qc, width = 8, height = 6)
+
+# SCTransform
+visium <- SCTransform(visium, assay = "spatial", verbose = FALSE)
+
+# Feature plot example
+p_acta2 <- SpatialFeaturePlot(visium, features = "ACTA2") + labs(title = "")
+ggsave(file.path(out_sample, paste0(sample_id, "_SpatialFeature_ACTA2.pdf")),
+       plot = p_acta2, width = 8, height = 6, dpi = 300)
+
+# PCA/UMAP/Clustering
+visium <- RunPCA(visium, assay = "SCT", verbose = FALSE)
+visium <- FindNeighbors(visium, reduction = "pca", dims = 1:30)
+visium <- FindClusters(visium, verbose = FALSE)
+visium <- RunUMAP(visium, reduction = "pca", dims = 1:30)
+
+p_umap <- DimPlot(visium, reduction = "umap", label = TRUE, label.size = 6) + theme(text = element_text(size = 14))
+p_spcl <- SpatialDimPlot(visium, label = TRUE, label.size = 3, pt.size.factor = 2) +
+  labs(fill = "Cluster") + theme(text = element_text(size = 14))
+
+ggsave(file.path(out_sample, paste0(sample_id, "_UMAP.pdf")),   p_umap, width = 6, height = 5, dpi = 300)
+ggsave(file.path(out_sample, paste0(sample_id, "_SpatialClusters.pdf")), p_spcl, width = 6, height = 5, dpi = 300)
+ggsave(file.path(out_sample, paste0(sample_id, "_UMAP_plus_Spatial.pdf")),
+       p_umap + p_spcl, width = 12, height = 5, dpi = 300)
+
+saveRDS(visium, file.path(out_sample, paste0(sample_id, "_spatial_analysis.rds")))
+
+# ------------------------------------------------------------
+# 2) Build RCTD reference from scRNA-seq integrated Seurat object
+# ------------------------------------------------------------
+sc <- readRDS(sc_rds)
+
+# Optional: rename sc identities to cell types (must match identities)
+new.cluster.ids <- c(
+  "Fibroblasts","CD8+ T cells","CD4+ T cells","Macrophages","Fibroblasts",
+  "Tumor cells","CD8+ T cells","B cells","Tumor cells","Stellate cells",
+  "Endothelial cells","CD4+ T cells","Mast cells","NK cells","CD4+ T cells",
+  "Neutrophils","Endocrine cells","Tumor cells","Tumor cells",
+  "B cells","Dendritic cells","Ductal cells","Schwann cells",
+  "CD8+ T cells","Fibroblasts","Ductal cells","Endocrine cells"
+)
+if (length(new.cluster.ids) == length(levels(Idents(sc)))) {
+  names(new.cluster.ids) <- levels(Idents(sc))
+  sc <- RenameIdents(sc, new.cluster.ids)
+}
+sc$celltype <- as.character(Idents(sc))
+
+counts_sc <- get_counts_matrix(sc, assay = "RNA")
+nUMI_sc   <- colSums(counts_sc)
+
+cell_types <- sc$celltype
+names(cell_types) <- colnames(sc)
+cell_types <- as.factor(cell_types)
+
+reference <- Reference(counts_sc, cell_types, nUMI_sc)
+
+# ------------------------------------------------------------
+# 3) Build SpatialRNA query and run RCTD
+# ------------------------------------------------------------
+counts_spatial <- visium[["spatial"]]$counts
+coords <- GetTissueCoordinates(visium)
+coords <- coords[, c("imagerow", "imagecol"), drop = FALSE]
+colnames(coords) <- c("x", "y")
+
+query <- SpatialRNA(coords, counts_spatial, colSums(counts_spatial))
+
+RCTD <- create.RCTD(query, reference, max_cores = rctd_cores)
+RCTD <- run.RCTD(RCTD, doublet_mode = "doublet")
+
+saveRDS(RCTD, file.path(out_sample, paste0(sample_id, "_RCTD.rds")))
+
+# Add RCTD results back to Seurat object
+visium_rctd <- AddMetaData(visium, metadata = RCTD@results$results_df)
+
+# Handle NA types
+for (col in c("first_type", "second_type")) {
+  if (col %in% colnames(visium_rctd@meta.data)) {
+    visium_rctd[[col]] <- as.character(visium_rctd[[col]])
+    visium_rctd[[col]][is.na(visium_rctd[[col]])] <- "Unknown"
+    visium_rctd[[col]] <- factor(visium_rctd[[col]])
+  }
+}
+
+p_first <- SpatialDimPlot(visium_rctd, group.by = "first_type", pt.size.factor = 2) +
+  theme(text = element_text(size = 14), legend.title = element_blank()) +
+  guides(fill = guide_legend(override.aes = list(size = 4)))
+
+p_second <- SpatialDimPlot(visium_rctd, group.by = "second_type", pt.size.factor = 2) +
+  theme(text = element_text(size = 14), legend.title = element_blank()) +
+  guides(fill = guide_legend(override.aes = list(size = 4)))
+
+ggsave(file.path(out_sample, paste0(sample_id, "_RCTD_first_type.pdf")), p_first, width = 8, height = 5, dpi = 300)
+ggsave(file.path(out_sample, paste0(sample_id, "_RCTD_second_type.pdf")), p_second, width = 8, height = 5, dpi = 300)
+ggsave(file.path(out_sample, paste0(sample_id, "_RCTD_first_plus_second.pdf")),
+       p_first + p_second, width = 12, height = 5, dpi = 300)
+
+saveRDS(visium_rctd, file.path(out_sample, paste0(sample_id, "_spatial_with_RCTD.rds")))
+
+# ------------------------------------------------------------
+# 4) kNN smoothing on spatial expression and gene-wise correlation with EHF
+# ------------------------------------------------------------
+# log2(counts+1)
+log2_counts <- log2(as.matrix(counts_spatial) + 1)
+
+# kNN on coords
+nn <- get.knn(as.matrix(coords), k = knn_k)
+
+avg_expr <- matrix(NA_real_, nrow = nrow(log2_counts), ncol = ncol(log2_counts))
+rownames(avg_expr) <- rownames(log2_counts)
+colnames(avg_expr) <- colnames(log2_counts)
+
+for (i in seq_len(ncol(log2_counts))) {
+  nb <- nn$nn.index[i, ]
+  idx <- c(i, nb)
+  avg_expr[, i] <- rowMeans(log2_counts[, idx, drop = FALSE])
+}
+
+if (!"EHF" %in% rownames(avg_expr)) stop("EHF not found in spatial expression matrix.")
+
+EHF_vec <- avg_expr["EHF", ]
+
+gene_corr <- apply(avg_expr, 1, function(x) {
+  ct <- suppressWarnings(cor.test(x, EHF_vec, method = "pearson"))
+  c(correlation = unname(ct$estimate), p.value = ct$p.value)
+})
+
+gene_corr_df <- as.data.frame(t(gene_corr))
+gene_corr_df$Gene <- rownames(gene_corr_df)
+gene_corr_df <- gene_corr_df[, c("Gene", "correlation", "p.value")]
+gene_corr_df <- gene_corr_df[order(gene_corr_df$correlation, decreasing = TRUE), ]
+
+write.csv(gene_corr_df, file.path(out_sample, paste0(sample_id, "_EHF_gene_correlations.csv")),
+          row.names = FALSE)
+
+# Check CAF genes of interest
+caf_genes <- c("COL1A1", "ACTA2", "POSTN")
+caf_hit <- gene_corr_df[gene_corr_df$Gene %in% caf_genes, ]
+write.csv(caf_hit, file.path(out_sample, paste0(sample_id, "_CAFgenes_EHF_correlations.csv")),
+          row.names = FALSE)
+
+# ------------------------------------------------------------
+# 5) Correlation: EHF vs Fibroblasts abundance from RCTD weights
+# ------------------------------------------------------------
+weights <- RCTD@results$weights
+if (!"Fibroblasts" %in% colnames(weights)) {
+  warning("Fibroblasts not found in RCTD weights columns. Available: ",
+          paste(colnames(weights), collapse = ", "))
+} else {
+  fibro_abund <- weights[, "Fibroblasts"]
+
+  # Align by spot barcode
+  common_spots <- intersect(names(EHF_vec), names(fibro_abund))
+  EHF_common   <- EHF_vec[common_spots]
+  fibro_common <- fibro_abund[common_spots]
+
+  cor_res <- cor.test(EHF_common, fibro_common, method = "pearson")
+  cor_df <- data.frame(correlation = unname(cor_res$estimate), p.value = cor_res$p.value)
+  write.csv(cor_df, file.path(out_sample, paste0(sample_id, "_EHF_Fibroblasts_correlation_stats.csv")),
+            row.names = FALSE)
+
+  plot_data <- data.frame(EHF = EHF_common, Fibroblasts = fibro_common)
+
+  x_pos <- mean(range(plot_data$EHF))
+  y_pos <- max(plot_data$Fibroblasts) * 1.05
+
+  p_scatter <- ggplot(plot_data, aes(x = EHF, y = Fibroblasts)) +
+    geom_jitter(alpha = 0.6, width = 0.03, height = 0.01, size = 1.8) +
+    geom_smooth(method = "lm") +
+    stat_cor(method = "pearson", label.x = x_pos, label.y = y_pos, size = 5, hjust = 0.5) +
+    labs(title = "", x = "EHF (smoothed log2 expr)", y = "Fibroblasts abundance (RCTD)") +
+    theme_classic(base_size = 14)
+
+  ggsave(file.path(out_sample, paste0(sample_id, "_EHF_Fibroblasts_scatter.pdf")),
+         plot = p_scatter, width = 6, height = 5, dpi = 300)
+}
+
+message("Spatial + RCTD + correlation pipeline completed for: ", sample_id)
+message("Outputs saved in: ", normalizePath(out_sample))
